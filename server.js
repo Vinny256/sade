@@ -4,15 +4,21 @@ const axios = require('axios');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const morgan = require('morgan');
 
 const app = express();
-app.use(cors()); // Allows MikroTik to talk to Render
+
+// 1. MIDDLEWARE SETUP
+app.use(cors());
 app.use(bodyParser.json());
 
-// 1. Database Connection
+// CUSTOM LOGGING: Shows Method, URL, Status, and Response Time in Render Logs
+app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
+
+// 2. DATABASE CONNECTION
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ Sade Net Database Connected"))
-    .catch(err => console.error("❌ DB Connection Error:", err));
+    .then(() => console.log("✅ [DB] Connected to Sade Net Database"))
+    .catch(err => console.error("❌ [DB] Connection Error:", err));
 
 const TransactionSchema = new mongoose.Schema({
     phoneNumber: String,
@@ -25,28 +31,34 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-// 2. Helper: Get Live M-Pesa Token
+// 3. OAUTH TOKEN HELPER (LIVE)
 const getMpesaToken = async () => {
+    console.log("🔑 [Auth] Requesting M-Pesa Access Token...");
     const auth = Buffer.from(`${process.env.CONSUMER_KEY}:${process.env.CONSUMER_SECRET}`).toString('base64');
     try {
         const response = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
             headers: { Authorization: `Basic ${auth}` }
         });
+        console.log("✅ [Auth] Token received successfully.");
         return response.data.access_token;
     } catch (error) {
-        console.error("Token Error:", error.response?.data || error.message);
-        throw new Error("Failed to get Safaricom Token");
+        console.error("❌ [Auth] Error:", error.response?.data || error.message);
+        throw error;
     }
 };
 
-// 3. Keep-Alive / Health Check
-app.get('/ping', (req, res) => res.json({ status: "Awake" }));
+// 4. KEEP-ALIVE (MIKROTIK PING)
+app.get('/ping', (req, res) => {
+    console.log(`📡 [MikroTik] Heartbeat received at ${new Date().toLocaleTimeString()}`);
+    res.json({ status: "Vinnie Digital Hub is Awake" });
+});
 
-// 4. Live STK Push Route
+// 5. STK PUSH INITIATION (LIVE)
 app.post('/stk-push', async (req, res) => {
     let { phone, plan, amount } = req.body;
+    console.log(`🖱️ [Frontend] Button Clicked! Plan: ${plan}, Phone: ${phone}`);
 
-    // Format Phone: 07xx -> 2547xx
+    // Convert 07... to 2547...
     if (phone.startsWith('0')) phone = '254' + phone.substring(1);
     if (phone.startsWith('7')) phone = '254' + phone;
 
@@ -59,21 +71,24 @@ app.post('/stk-push', async (req, res) => {
             BusinessShortCode: process.env.BUSINESS_SHORT_CODE,
             Password: password,
             Timestamp: timestamp,
-            TransactionType: "CustomerPayBillOnline", // Use CustomerBuyGoodsOnline if using a Till
+            TransactionType: "CustomerPayBillOnline", // Change to "CustomerBuyGoodsOnline" if using Till
             Amount: amount,
             PartyA: phone,
             PartyB: process.env.BUSINESS_SHORT_CODE,
             PhoneNumber: phone,
             CallBackURL: process.env.CALLBACK_URL,
             AccountReference: "SADE NET",
-            TransactionDesc: `WiFi ${plan}`
+            TransactionDesc: `WiFi Access: ${plan}`
         };
 
+        console.log(`📤 [Safaricom] Sending STK Push to ${phone} for ${amount}/=`);
         const response = await axios.post(
             'https://api.safaricom.co.ke/mpesa/stkpush/v1/query',
             requestData,
             { headers: { Authorization: `Bearer ${token}` } }
         );
+
+        console.log(`🚀 [Safaricom] STK Accepted! CheckoutID: ${response.data.CheckoutRequestID}`);
 
         const newTx = new Transaction({
             phoneNumber: phone,
@@ -85,49 +100,47 @@ app.post('/stk-push', async (req, res) => {
 
         res.status(200).json({ success: true, checkoutID: response.data.CheckoutRequestID });
     } catch (error) {
-        console.error("STK Error:", error.response?.data || error.message);
-        res.status(500).json({ error: "M-Pesa session failed" });
+        console.error("❌ [STK Error]:", error.response?.data || error.message);
+        res.status(500).json({ error: "Failed to trigger M-Pesa prompt" });
     }
 });
 
-// 5. Live Callback Listener
+// 6. MPESA CALLBACK (LIVE)
 app.post('/callback', async (req, res) => {
+    console.log("📩 [Safaricom] New Callback Received!");
     const { Body: { stkCallback } } = req.body;
     
     const checkoutID = stkCallback.CheckoutRequestID;
     const resultCode = stkCallback.ResultCode;
 
     if (resultCode === 0) {
-        // Find receipt number in metadata
         const metadata = stkCallback.CallbackMetadata.Item;
         const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
+        const paidAmount = metadata.find(item => item.Name === 'Amount')?.Value;
+
+        console.log(`💰 [Payment SUCCESS] Receipt: ${receipt}, Amount: ${paidAmount}, ID: ${checkoutID}`);
 
         await Transaction.findOneAndUpdate(
             { checkoutRequestID: checkoutID }, 
             { status: 'Success', mpesaReceipt: receipt }
         );
-        console.log(`💰 Success: ${receipt} for ${checkoutID}`);
     } else {
+        console.log(`⚠️ [Payment FAILED/CANCELLED] ID: ${checkoutID}, Code: ${resultCode}`);
         await Transaction.findOneAndUpdate({ checkoutRequestID: checkoutID }, { status: 'Failed' });
     }
-    res.json("Accepted");
+    res.json({ ResultCode: 0, ResultDesc: "Success" });
 });
 
-// 6. Polling: Frontend checks if paid
+// 7. POLLING FOR FRONTEND
 app.get('/status/:checkoutID', async (req, res) => {
     const tx = await Transaction.findOne({ checkoutRequestID: req.params.checkoutID });
     if (tx && tx.status === 'Success') {
+        console.log(`🔓 [Access] Plan granted for ${tx.phoneNumber}`);
         res.json({ paid: true, plan: tx.plan });
     } else {
         res.json({ paid: false });
     }
 });
 
-// 7. Admin: Get Stats
-app.get('/admin/sales', async (req, res) => {
-    const sales = await Transaction.find({ status: 'Success' }).sort({ createdAt: -1 });
-    res.json(sales);
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Sade Net Live on Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 [Server] Sade Net LIVE on Port ${PORT}`));
