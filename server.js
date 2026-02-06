@@ -30,21 +30,46 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-// --- NEW CODE START: THE PULL QUEUE ---
+// --- NEW CODE START: THE PULL QUEUE & LOGGING ---
 // This temporary list stores paid users until the MikroTik fetches them
 let paidQueue = []; 
 
+// Endpoint for MikroTik to pull the latest paid user
 app.get('/latest-paid', (req, res) => {
+    const timestamp = new Date().toLocaleTimeString();
     if (paidQueue.length > 0) {
         // Take the first user in the line
         const nextUser = paidQueue.shift(); 
-        console.log(`📡 [MikroTik Pull] Sending ${nextUser.phone} to Router...`);
+        console.log(`📡 [MikroTik Pull] SUCCESS: Sending ${nextUser.phone} to Router at ${timestamp}`);
+        console.log(`📊 [Queue Status] Remaining in queue: ${paidQueue.length}`);
+        
         // Format the response exactly how the MikroTik script expects: "phone,plan"
         res.send(`${nextUser.phone},${nextUser.plan}`);
     } else {
-        // If no one has paid, send "none" so the script does nothing
+        // Log that the router checked but no one was in the queue
+        console.log(`🔍 [MikroTik Pull] IDLE: Router checked for users at ${timestamp} (Queue Empty)`);
         res.send("none,none");
     }
+});
+
+// TEST ROUTE: To verify the bridge without paying
+app.get('/test-success', (req, res) => {
+    const { phone, plan } = req.query;
+    if (!phone || !plan) {
+        return res.status(400).send("Missing phone or plan parameters. Example: ?phone=0700123456&plan=10_sh_1hr");
+    }
+    paidQueue.push({ phone, plan });
+    console.log(`🧪 [Test] Manual entry added: ${phone} for ${plan}`);
+    res.send(`✅ Success! ${phone} is now waiting for the MikroTik to pull it.`);
+});
+
+// MONITOR ROUTE: To see the current queue size
+app.get('/queue-monitor', (req, res) => {
+    res.json({
+        activeQueueLength: paidQueue.length,
+        currentQueue: paidQueue,
+        serverTime: new Date().toLocaleTimeString()
+    });
 });
 // --- NEW CODE END ---
 
@@ -147,7 +172,7 @@ app.post('/callback', async (req, res) => {
         // --- NEW LOGIC: ADD TO QUEUE FOR MIKROTIK ---
         if (updatedTx) {
             paidQueue.push({ phone: updatedTx.phoneNumber, plan: updatedTx.plan });
-            console.log(`📝 [Queue] Added ${updatedTx.phoneNumber} to pull queue.`);
+            console.log(`📝 [Queue] SUCCESS: Added ${updatedTx.phoneNumber} to WinBox pull queue.`);
         }
         // --------------------------------------------
 
