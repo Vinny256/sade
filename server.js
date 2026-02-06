@@ -30,6 +30,24 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
+// --- NEW CODE START: THE PULL QUEUE ---
+// This temporary list stores paid users until the MikroTik fetches them
+let paidQueue = []; 
+
+app.get('/latest-paid', (req, res) => {
+    if (paidQueue.length > 0) {
+        // Take the first user in the line
+        const nextUser = paidQueue.shift(); 
+        console.log(`📡 [MikroTik Pull] Sending ${nextUser.phone} to Router...`);
+        // Format the response exactly how the MikroTik script expects: "phone,plan"
+        res.send(`${nextUser.phone},${nextUser.plan}`);
+    } else {
+        // If no one has paid, send "none" so the script does nothing
+        res.send("none,none");
+    }
+});
+// --- NEW CODE END ---
+
 // 3. LIVE OAUTH TOKEN HELPER
 const getMpesaToken = async () => {
     console.log("🔑 [Auth] Requesting M-Pesa Access Token...");
@@ -119,10 +137,20 @@ app.post('/callback', async (req, res) => {
         const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
         console.log(`💰 [Payment SUCCESS] Receipt: ${receipt} for ID: ${checkoutID}`);
 
-        await Transaction.findOneAndUpdate(
+        // Update database
+        const updatedTx = await Transaction.findOneAndUpdate(
             { checkoutRequestID: checkoutID }, 
-            { status: 'Success', mpesaReceipt: receipt }
+            { status: 'Success', mpesaReceipt: receipt },
+            { new: true }
         );
+
+        // --- NEW LOGIC: ADD TO QUEUE FOR MIKROTIK ---
+        if (updatedTx) {
+            paidQueue.push({ phone: updatedTx.phoneNumber, plan: updatedTx.plan });
+            console.log(`📝 [Queue] Added ${updatedTx.phoneNumber} to pull queue.`);
+        }
+        // --------------------------------------------
+
     } else {
         console.log(`⚠️ [Payment FAILED] ID: ${checkoutID}, Code: ${resultCode}`);
         await Transaction.findOneAndUpdate({ checkoutRequestID: checkoutID }, { status: 'Failed' });
