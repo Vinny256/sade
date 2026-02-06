@@ -8,14 +8,13 @@ const morgan = require('morgan');
 
 const app = express();
 
-// 1. MIDDLEWARE SETUP
+// 1. MIDDLEWARE & LOGGING
 app.use(cors());
 app.use(bodyParser.json());
-
-// CUSTOM LOGGING: Shows Method, URL, Status, and Response Time in Render Logs
+// Aggressive logging for Render
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
-// 2. DATABASE CONNECTION
+// 2. DATABASE CONNECTION (For Admin Portal)
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ [DB] Connected to Sade Net Database"))
     .catch(err => console.error("❌ [DB] Connection Error:", err));
@@ -31,7 +30,7 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-// 3. OAUTH TOKEN HELPER (LIVE)
+// 3. LIVE OAUTH TOKEN HELPER
 const getMpesaToken = async () => {
     console.log("🔑 [Auth] Requesting M-Pesa Access Token...");
     const auth = Buffer.from(`${process.env.CONSUMER_KEY}:${process.env.CONSUMER_SECRET}`).toString('base64');
@@ -47,18 +46,18 @@ const getMpesaToken = async () => {
     }
 };
 
-// 4. KEEP-ALIVE (MIKROTIK PING)
+// 4. MIKROTIK PINGER (Keep-Alive)
 app.get('/ping', (req, res) => {
     console.log(`📡 [MikroTik] Heartbeat received at ${new Date().toLocaleTimeString()}`);
     res.json({ status: "Vinnie Digital Hub is Awake" });
 });
 
-// 5. STK PUSH INITIATION (LIVE)
+// 5. STK PUSH (LIVE)
 app.post('/stk-push', async (req, res) => {
     let { phone, plan, amount } = req.body;
     console.log(`🖱️ [Frontend] Button Clicked! Plan: ${plan}, Phone: ${phone}`);
 
-    // Convert 07... to 2547...
+    // Format: 07... to 2547...
     if (phone.startsWith('0')) phone = '254' + phone.substring(1);
     if (phone.startsWith('7')) phone = '254' + phone;
 
@@ -71,7 +70,7 @@ app.post('/stk-push', async (req, res) => {
             BusinessShortCode: process.env.BUSINESS_SHORT_CODE,
             Password: password,
             Timestamp: timestamp,
-            TransactionType: "CustomerPayBillOnline", // Change to "CustomerBuyGoodsOnline" if using Till
+            TransactionType: "CustomerPayBillOnline", // "CustomerBuyGoodsOnline" for Till
             Amount: amount,
             PartyA: phone,
             PartyB: process.env.BUSINESS_SHORT_CODE,
@@ -82,8 +81,10 @@ app.post('/stk-push', async (req, res) => {
         };
 
         console.log(`📤 [Safaricom] Sending STK Push to ${phone} for ${amount}/=`);
+        
+        // FIXED ENDPOINT FOR LIVE PRODUCTION
         const response = await axios.post(
-            'https://api.safaricom.co.ke/mpesa/stkpush/v1/query',
+            'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
             requestData,
             { headers: { Authorization: `Bearer ${token}` } }
         );
@@ -100,7 +101,7 @@ app.post('/stk-push', async (req, res) => {
 
         res.status(200).json({ success: true, checkoutID: response.data.CheckoutRequestID });
     } catch (error) {
-        console.error("❌ [STK Error]:", error.response?.data || error.message);
+        console.error("❌ [STK Error]:", JSON.stringify(error.response?.data || error.message, null, 2));
         res.status(500).json({ error: "Failed to trigger M-Pesa prompt" });
     }
 });
@@ -116,22 +117,20 @@ app.post('/callback', async (req, res) => {
     if (resultCode === 0) {
         const metadata = stkCallback.CallbackMetadata.Item;
         const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
-        const paidAmount = metadata.find(item => item.Name === 'Amount')?.Value;
-
-        console.log(`💰 [Payment SUCCESS] Receipt: ${receipt}, Amount: ${paidAmount}, ID: ${checkoutID}`);
+        console.log(`💰 [Payment SUCCESS] Receipt: ${receipt} for ID: ${checkoutID}`);
 
         await Transaction.findOneAndUpdate(
             { checkoutRequestID: checkoutID }, 
             { status: 'Success', mpesaReceipt: receipt }
         );
     } else {
-        console.log(`⚠️ [Payment FAILED/CANCELLED] ID: ${checkoutID}, Code: ${resultCode}`);
+        console.log(`⚠️ [Payment FAILED] ID: ${checkoutID}, Code: ${resultCode}`);
         await Transaction.findOneAndUpdate({ checkoutRequestID: checkoutID }, { status: 'Failed' });
     }
     res.json({ ResultCode: 0, ResultDesc: "Success" });
 });
 
-// 7. POLLING FOR FRONTEND
+// 7. STATUS POLLING
 app.get('/status/:checkoutID', async (req, res) => {
     const tx = await Transaction.findOne({ checkoutRequestID: req.params.checkoutID });
     if (tx && tx.status === 'Success') {
@@ -142,5 +141,5 @@ app.get('/status/:checkoutID', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 [Server] Sade Net LIVE on Port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 [Server] Sade Net LIVE on Port ${PORT}`));
