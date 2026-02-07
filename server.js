@@ -91,6 +91,49 @@ app.post('/claim-voucher', async (req, res) => {
     }
 });
 
+// --- SURGICAL ADDITION: VOUCHER ACTIVATION FOR LOGIN PAGE ---
+app.post('/api/vouchers/activate', async (req, res) => {
+    const { code } = req.body;
+    console.log(`🎫 [Voucher Request] Code: ${code} submitted via Login Page`);
+
+    try {
+        // Find the voucher matching the entered code
+        const voucher = await Voucher.findOne({ code: code.trim() });
+
+        if (!voucher) {
+            console.log(`❌ [Activation Denied] Code ${code} not found in database.`);
+            return res.status(404).json({ success: false, message: "Invalid SADE Code!" });
+        }
+
+        if (voucher.used) {
+            console.log(`⚠️ [Activation Denied] Code ${code} has already been claimed.`);
+            return res.status(400).json({ success: false, message: "This code is already used!" });
+        }
+
+        // Mark it as used immediately
+        voucher.used = true;
+        voucher.usedBy = "VOUCHER_USER"; // Track that this came from the voucher system
+        await voucher.save();
+
+        // Push to the same queue the M-Pesa payments use
+        // Router will use the code as the username
+        paidQueue.push({ phone: voucher.code, plan: voucher.plan });
+        
+        console.log(`🚀 [Queue Add] Voucher ${voucher.code} added to MikroTik Pull Queue for plan: ${voucher.plan}`);
+
+        res.json({ 
+            success: true, 
+            message: "Success! Your access is being prepared.",
+            username: voucher.code, 
+            password: voucher.code 
+        });
+
+    } catch (err) {
+        console.error("❌ [Activation Server Error]:", err);
+        res.status(500).json({ success: false, message: "System error. Please try again." });
+    }
+});
+
 // TEST ROUTE: To verify the bridge without paying
 app.get('/test-success', (req, res) => {
     const { phone, plan } = req.query;
@@ -197,7 +240,6 @@ app.post('/callback', async (req, res) => {
         const metadata = stkCallback.CallbackMetadata.Item;
         const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
         
-        // --- EXTRACTION OF NAME ---
         const fName = metadata.find(item => item.Name === 'FirstName')?.Value || "";
         const mName = metadata.find(item => item.Name === 'MiddleName')?.Value || "";
         const lName = metadata.find(item => item.Name === 'LastName')?.Value || "";
@@ -205,7 +247,6 @@ app.post('/callback', async (req, res) => {
         
         console.log(`💰 [Payment SUCCESS] Receipt: ${receipt} | Name: ${fullName}`);
 
-        // Update database with status AND name
         const updatedTx = await Transaction.findOneAndUpdate(
             { checkoutRequestID: checkoutID }, 
             { status: 'Success', mpesaReceipt: receipt, mpesaName: fullName },
