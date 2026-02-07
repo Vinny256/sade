@@ -19,10 +19,12 @@ mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ [DB] Connected to Sade Net Database"))
     .catch(err => console.error("❌ [DB] Connection Error:", err));
 
+// --- UPDATED SCHEMA TO INCLUDE MPESA NAME ---
 const TransactionSchema = new mongoose.Schema({
     phoneNumber: String,
     amount: Number,
     plan: String,
+    mpesaName: { type: String, default: 'Customer' }, // Added for Admin Portal
     checkoutRequestID: String,
     status: { type: String, default: 'Pending' },
     mpesaReceipt: String,
@@ -30,25 +32,62 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-// --- NEW CODE START: THE PULL QUEUE & LOGGING ---
-// This temporary list stores paid users until the MikroTik fetches them
+// --- NEW SCHEMA: VOUCHERS (10-DIGIT NUMERIC) ---
+const VoucherSchema = new mongoose.Schema({
+    code: { type: String, unique: true, required: true },
+    plan: String,
+    amount: Number,
+    agentName: { type: String, default: 'Direct' },
+    used: { type: Boolean, default: false },
+    usedBy: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now }
+});
+const Voucher = mongoose.model('Voucher', VoucherSchema);
+
+// --- THE PULL QUEUE & LOGGING ---
 let paidQueue = []; 
 
 // Endpoint for MikroTik to pull the latest paid user
 app.get('/latest-paid', (req, res) => {
     const timestamp = new Date().toLocaleTimeString();
     if (paidQueue.length > 0) {
-        // Take the first user in the line
         const nextUser = paidQueue.shift(); 
         console.log(`📡 [MikroTik Pull] SUCCESS: Sending ${nextUser.phone} to Router at ${timestamp}`);
         console.log(`📊 [Queue Status] Remaining in queue: ${paidQueue.length}`);
-        
-        // Format the response exactly how the MikroTik script expects: "phone,plan"
         res.send(`${nextUser.phone},${nextUser.plan}`);
     } else {
-        // Log that the router checked but no one was in the queue
         console.log(`🔍 [MikroTik Pull] IDLE: Router checked for users at ${timestamp} (Queue Empty)`);
         res.send("none,none");
+    }
+});
+
+// --- NEW ROUTE: CLAIM VOUCHER (10-DIGIT ONLY) ---
+app.post('/claim-voucher', async (req, res) => {
+    const { code, phone } = req.body;
+    console.log(`🎟️ [Voucher Attempt] Code: ${code} from Phone: ${phone}`);
+
+    try {
+        const voucher = await Voucher.findOne({ code: code, used: false });
+
+        if (!voucher) {
+            console.log(`❌ [Voucher Failed] Code ${code} is invalid or used.`);
+            return res.status(400).json({ success: false, message: "Invalid or used voucher code" });
+        }
+
+        // Mark as used
+        voucher.used = true;
+        voucher.usedBy = phone;
+        await voucher.save();
+
+        // Add to MikroTik Queue
+        paidQueue.push({ phone: phone, plan: voucher.plan });
+        
+        console.log(`✅ [Voucher SUCCESS] ${phone} activated via Code ${code}`);
+        res.json({ success: true, message: "Voucher activated! Connecting..." });
+
+    } catch (err) {
+        console.error("❌ [Voucher Error]:", err);
+        res.status(500).json({ success: false, message: "Internal server error" });
     }
 });
 
@@ -56,14 +95,14 @@ app.get('/latest-paid', (req, res) => {
 app.get('/test-success', (req, res) => {
     const { phone, plan } = req.query;
     if (!phone || !plan) {
-        return res.status(400).send("Missing phone or plan parameters. Example: ?phone=0700123456&plan=10_sh_1hr");
+        return res.status(400).send("Missing phone or plan parameters.");
     }
     paidQueue.push({ phone, plan });
     console.log(`🧪 [Test] Manual entry added: ${phone} for ${plan}`);
     res.send(`✅ Success! ${phone} is now waiting for the MikroTik to pull it.`);
 });
 
-// MONITOR ROUTE: To see the current queue size
+// MONITOR ROUTE
 app.get('/queue-monitor', (req, res) => {
     res.json({
         activeQueueLength: paidQueue.length,
@@ -71,7 +110,6 @@ app.get('/queue-monitor', (req, res) => {
         serverTime: new Date().toLocaleTimeString()
     });
 });
-// --- NEW CODE END ---
 
 // 3. LIVE OAUTH TOKEN HELPER
 const getMpesaToken = async () => {
@@ -100,7 +138,6 @@ app.post('/stk-push', async (req, res) => {
     let { phone, plan, amount } = req.body;
     console.log(`🖱️ [Frontend] Button Clicked! Plan: ${plan}, Phone: ${phone}`);
 
-    // Format: 07... to 2547...
     if (phone.startsWith('0')) phone = '254' + phone.substring(1);
     if (phone.startsWith('7')) phone = '254' + phone;
 
@@ -113,7 +150,7 @@ app.post('/stk-push', async (req, res) => {
             BusinessShortCode: process.env.BUSINESS_SHORT_CODE,
             Password: password,
             Timestamp: timestamp,
-            TransactionType: "CustomerPayBillOnline", // "CustomerBuyGoodsOnline" for Till
+            TransactionType: "CustomerPayBillOnline",
             Amount: amount,
             PartyA: phone,
             PartyB: process.env.BUSINESS_SHORT_CODE,
@@ -125,7 +162,6 @@ app.post('/stk-push', async (req, res) => {
 
         console.log(`📤 [Safaricom] Sending STK Push to ${phone} for ${amount}/=`);
         
-        // FIXED ENDPOINT FOR LIVE PRODUCTION
         const response = await axios.post(
             'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
             requestData,
@@ -149,7 +185,7 @@ app.post('/stk-push', async (req, res) => {
     }
 });
 
-// 6. MPESA CALLBACK (LIVE)
+// 6. MPESA CALLBACK (LIVE - WITH NAME EXTRACTION)
 app.post('/callback', async (req, res) => {
     console.log("📩 [Safaricom] New Callback Received!");
     const { Body: { stkCallback } } = req.body;
@@ -160,21 +196,26 @@ app.post('/callback', async (req, res) => {
     if (resultCode === 0) {
         const metadata = stkCallback.CallbackMetadata.Item;
         const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
-        console.log(`💰 [Payment SUCCESS] Receipt: ${receipt} for ID: ${checkoutID}`);
+        
+        // --- EXTRACTION OF NAME ---
+        const fName = metadata.find(item => item.Name === 'FirstName')?.Value || "";
+        const mName = metadata.find(item => item.Name === 'MiddleName')?.Value || "";
+        const lName = metadata.find(item => item.Name === 'LastName')?.Value || "";
+        const fullName = `${fName} ${mName} ${lName}`.trim() || "Customer";
+        
+        console.log(`💰 [Payment SUCCESS] Receipt: ${receipt} | Name: ${fullName}`);
 
-        // Update database
+        // Update database with status AND name
         const updatedTx = await Transaction.findOneAndUpdate(
             { checkoutRequestID: checkoutID }, 
-            { status: 'Success', mpesaReceipt: receipt },
+            { status: 'Success', mpesaReceipt: receipt, mpesaName: fullName },
             { new: true }
         );
 
-        // --- NEW LOGIC: ADD TO QUEUE FOR MIKROTIK ---
         if (updatedTx) {
             paidQueue.push({ phone: updatedTx.phoneNumber, plan: updatedTx.plan });
             console.log(`📝 [Queue] SUCCESS: Added ${updatedTx.phoneNumber} to WinBox pull queue.`);
         }
-        // --------------------------------------------
 
     } else {
         console.log(`⚠️ [Payment FAILED] ID: ${checkoutID}, Code: ${resultCode}`);
